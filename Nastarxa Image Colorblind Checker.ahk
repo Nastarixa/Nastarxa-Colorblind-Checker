@@ -162,6 +162,27 @@ class GDI {
         return status = 0
     }
 
+    static DrawHighlightRect(pBitmap, x, y, w, h) {
+        if !pBitmap || w < 1 || h < 1
+            return
+        gfx := 0, pen := 0, brush := 0
+        if DllCall("gdiplus\GdipGetImageGraphicsContext", "Ptr", pBitmap, "Ptr*", &gfx)
+            return
+        DllCall("gdiplus\GdipCreateSolidFill", "UInt", 0x44FFD400, "Ptr*", &brush)
+        if brush {
+            DllCall("gdiplus\GdipFillRectangle", "Ptr", gfx, "Ptr", brush
+                , "Float", x, "Float", y, "Float", w, "Float", h)
+            DllCall("gdiplus\GdipDeleteBrush", "Ptr", brush)
+        }
+        DllCall("gdiplus\GdipCreatePen1", "UInt", 0xFFFFD400, "Float", 3.0, "Int", 2, "Ptr*", &pen)
+        if pen {
+            DllCall("gdiplus\GdipDrawRectangle", "Ptr", gfx, "Ptr", pen
+                , "Float", x, "Float", y, "Float", w, "Float", h)
+            DllCall("gdiplus\GdipDeletePen", "Ptr", pen)
+        }
+        DllCall("gdiplus\GdipDeleteGraphics", "Ptr", gfx)
+    }
+
     static ApplyColorMatrix(pBitmap, matrix) {
         if !pBitmap
             return 0
@@ -404,37 +425,23 @@ SimulateColorblindness(pBitmap, type, progressCb := 0) {
 ; Build a "confusion heatmap" showing where colors become indistinguishable
 BuildConfusionMap(pOriginal, pSimulated, type) {
     dims := GDI.GetDimensions(pOriginal)
-    pHeat := GDI.CloneBitmapArea(pOriginal, 0, 0, dims.w, dims.h)
-
-    origInfo := GDI.LockBits(pOriginal, &bd1)
-    simInfo := GDI.LockBits(pSimulated, &bd2)
-    heatInfo := GDI.LockBits(pHeat, &bd3)
-
-    origScan := origInfo.Scan0
-    simScan := simInfo.Scan0
-    heatScan := heatInfo.Scan0
-    stride := origInfo.Stride
+    pHeat := GDI.CreateBitmap(dims.w, dims.h)
 
     maxDist := 0
     distances := []
 
-    loop origInfo.Height {
+    loop dims.h {
         y := A_Index - 1
-        loop origInfo.Width {
+        loop dims.w {
             x := A_Index - 1
-            offset := y * stride + x * 4
-
-            ; Original pixel
-            ob := NumGet(origScan, offset, "UChar")
-            og := NumGet(origScan, offset + 1, "UChar")
-            or_ := NumGet(origScan, offset + 2, "UChar")
-
-            ; Simulated pixel
-            sb := NumGet(simScan, offset, "UChar")
-            sg := NumGet(simScan, offset + 1, "UChar")
-            sr := NumGet(simScan, offset + 2, "UChar")
-
-            ; Perceptual distance between original and simulated
+            orig := GDI.GetPixel(pOriginal, x, y)
+            sim := GDI.GetPixel(pSimulated, x, y)
+            ob := orig & 0xFF
+            og := (orig >> 8) & 0xFF
+            or_ := (orig >> 16) & 0xFF
+            sb := sim & 0xFF
+            sg := (sim >> 8) & 0xFF
+            sr := (sim >> 16) & 0xFF
             dist := PerceptualDistance(or_, og, ob, sr, sg, sb)
             distances.Push(dist)
             if dist > maxDist
@@ -447,33 +454,29 @@ BuildConfusionMap(pOriginal, pSimulated, type) {
 
     ; Second pass: paint heatmap
     idx := 1
-    loop origInfo.Height {
+    loop dims.h {
         y := A_Index - 1
-        loop origInfo.Width {
+        loop dims.w {
             x := A_Index - 1
-            offset := y * stride + x * 4
             dist := distances[idx]
             idx += 1
 
-            ; Normalize: 0 = no change (green), 1 = big change (red)
-            t := dist / maxDist
-            ; Invert: small change = BAD (high confusion) = red highlight
-            t := 1 - t
+            ; Bright red/yellow = strongest color shift under simulation.
+            ; Cyan/blue = lower shift. This is intentionally high-contrast.
+            t := Min(1, Max(0, dist / maxDist))
+            if t < 0.5 {
+                r := 0
+                g := Round(255 * (t * 2))
+                b := 255
+            } else {
+                r := 255
+                g := Round(255 * (1 - ((t - 0.5) * 2)))
+                b := 0
+            }
 
-            ; Red where colors barely change (confused), green where they change a lot (distinguishable)
-            r := Round(255 * t)
-            g := Round(255 * (1 - t))
-            b := 0
-
-            NumPut("UChar", 0, heatScan, offset)       ; B
-            NumPut("UChar", g, heatScan, offset + 1)    ; G
-            NumPut("UChar", r, heatScan, offset + 2)    ; R
+            GDI.SetPixel(pHeat, x, y, 0xFF000000 | (r << 16) | (g << 8) | b)
         }
     }
-
-    GDI.UnlockBits(pOriginal, &bd1)
-    GDI.UnlockBits(pSimulated, &bd2)
-    GDI.UnlockBits(pHeat, &bd3)
 
     return pHeat
 }
@@ -1029,6 +1032,151 @@ GenerateSuggestions(topColors, type) {
     return suggestions
 }
 
+BuildSuggestionSwatches(topColors, type) {
+    swatches := []
+    seen := Map()
+    static replacements := [
+        {name: "blue", hex: "0077BB"},
+        {name: "orange", hex: "EE7733"},
+        {name: "green", hex: "009988"},
+        {name: "vermillion", hex: "CC3311"},
+        {name: "sky blue", hex: "88CCEE"},
+        {name: "yellow", hex: "DDCC77"},
+        {name: "purple", hex: "AA44DD"},
+        {name: "grey", hex: "BBBBBB"}
+    ]
+
+    SuggestedReplacement(c, avoid := "") {
+        best := replacements[1]
+        bestScore := -1
+        srcLum := RelativeLuminance(c.r, c.g, c.b)
+        for item in replacements {
+            if item.hex = avoid
+                continue
+            r := Integer("0x" SubStr(item.hex, 1, 2))
+            g := Integer("0x" SubStr(item.hex, 3, 2))
+            b := Integer("0x" SubStr(item.hex, 5, 2))
+            lumScore := Abs(srcLum - RelativeLuminance(r, g, b)) * 255
+            distScore := Sqrt((c.r-r)**2 + (c.g-g)**2 + (c.b-b)**2)
+            score := lumScore + distScore
+            if score > bestScore {
+                bestScore := score
+                best := item
+            }
+        }
+        return best
+    }
+
+    AddColor(c, reason := "Use safer palette color") {
+        hex := HexColor(c.r, c.g, c.b)
+        if seen.Has(hex)
+            return
+        seen[hex] := true
+        replacement := SuggestedReplacement(c)
+        swatches.Push({
+            hex: SubStr(hex, 2),
+            newHex: replacement.hex,
+            text: hex " -> #" replacement.hex " (" replacement.name ")",
+            reason: reason
+        })
+    }
+
+    if topColors.Length < 1
+        return swatches
+
+    ; Prefer colors that were actually mentioned by the suggestions.
+    loop topColors.Length - 1 {
+        i := A_Index
+        c1 := topColors[i]
+        loop topColors.Length - i {
+            j := i + A_Index
+            c2 := topColors[j]
+            diffR := Abs(c1.r - c2.r)
+            diffG := Abs(c1.g - c2.g)
+            diffB := Abs(c1.b - c2.b)
+            if diffR > 30 && diffG > 30 && diffB < 20 {
+                AddColor(c1, "Reduce red/green reliance")
+                AddColor(c2, "Reduce red/green reliance")
+            }
+
+            if type != "" {
+                m := GetCBMatrix(type)
+                sim1 := SimulateColor(c1.r, c1.g, c1.b, m)
+                sim2 := SimulateColor(c2.r, c2.g, c2.b, m)
+                cr := ContrastRatio(RelativeLuminance(sim1.r, sim1.g, sim1.b)
+                    , RelativeLuminance(sim2.r, sim2.g, sim2.b))
+                if cr < 3.0 {
+                    AddColor(c1, "Improve simulated contrast")
+                    AddColor(c2, "Improve simulated contrast")
+                }
+            }
+        }
+    }
+
+    ; If there are no flagged pairs, still show the dominant colors being analyzed.
+    if swatches.Length = 0 {
+        for c in topColors {
+            AddColor(c, "Optional safer alternative")
+            if swatches.Length >= 8
+                break
+        }
+    }
+
+    while swatches.Length > 8
+        swatches.Pop()
+    return swatches
+}
+
+UpdateSuggestionSwatches(g, topColors, type) {
+    if !HasProp(g, "suggestionSwatches")
+        return
+
+    swatches := BuildSuggestionSwatches(topColors, type)
+    g.suggestionSwatchCount := swatches.Length
+
+    for i, slot in g.suggestionSwatches {
+        if i <= swatches.Length {
+            swatch := swatches[i]
+            slot.box.Opt("Background" swatch.hex)
+            slot.box2.Opt("Background" swatch.newHex)
+            slot.label.Text := swatch.text
+            slot.box.Visible := true
+            slot.arrow.Visible := true
+            slot.box2.Visible := true
+            slot.label.Visible := true
+        } else {
+            slot.box.Visible := false
+            slot.arrow.Visible := false
+            slot.box2.Visible := false
+            slot.label.Visible := false
+        }
+    }
+}
+
+GetSuggestionSwatchHeight(g, fullW) {
+    if !HasProp(g, "suggestionSwatchCount") || g.suggestionSwatchCount = 0
+        return 0
+    cols := Max(1, Floor(fullW / 240))
+    return Ceil(g.suggestionSwatchCount / cols) * 22 + 8
+}
+
+PositionSuggestionSwatches(g, x, y, fullW) {
+    if !HasProp(g, "suggestionSwatches")
+        return
+    cols := Max(1, Floor(fullW / 240))
+    cellW := Floor(fullW / cols)
+    for i, slot in g.suggestionSwatches {
+        row := Floor((i - 1) / cols)
+        col := Mod(i - 1, cols)
+        sx := x + col * cellW
+        sy := y + row * 22
+        slot.box.Move(sx, sy + 2, 20, 16)
+        slot.arrow.Move(sx + 25, sy, 20, 20)
+        slot.box2.Move(sx + 48, sy + 2, 20, 16)
+        slot.label.Move(sx + 74, sy, cellW - 78, 20)
+    }
+}
+
 ; ===================================================================
 ; Save, Region, Color Picker
 ; ===================================================================
@@ -1044,7 +1192,65 @@ GetImageMimeFromExt(ext) {
         return "image/gif"
     if ext = "tif" || ext = "tiff"
         return "image/tiff"
+    if ext = "webp"
+        return "image/webp"
     return ""
+}
+
+FindImageMagick() {
+    static cached := unset
+    if IsSet(cached)
+        return cached
+    candidates := [
+        "C:\Program Files\ImageMagick-7.1.2-Q16-HDRI\magick.exe",
+        "C:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe",
+        "magick.exe"
+    ]
+    for exe in candidates {
+        if InStr(exe, "\") {
+            if FileExist(exe) {
+                cached := exe
+                return cached
+            }
+        } else {
+            try {
+                shell := ComObject("WScript.Shell")
+                exec := shell.Exec(A_ComSpec ' /C where.exe ' exe)
+                if !exec.StdOut.AtEndOfStream {
+                    path := Trim(exec.StdOut.ReadLine())
+                    if path != "" {
+                        cached := path
+                        return cached
+                    }
+                }
+            }
+        }
+    }
+    cached := ""
+    return cached
+}
+
+LoadBitmapWithFallback(file) {
+    pBitmap := GDI.LoadImage(file)
+    if pBitmap
+        return pBitmap
+
+    SplitPath(file, , , &ext)
+    if StrLower(ext) != "webp"
+        return 0
+
+    magick := FindImageMagick()
+    if magick = ""
+        return 0
+
+    tmpPng := A_Temp "\NastarxaColorblind_" A_TickCount ".png"
+    try FileDelete(tmpPng)
+    RunWait('"' magick '" "' file '" "' tmpPng '"', , "Hide")
+    if !FileExist(tmpPng)
+        return 0
+    pBitmap := GDI.LoadImage(tmpPng)
+    try FileDelete(tmpPng)
+    return pBitmap
 }
 
 GetDefaultSaveExt(g) {
@@ -1084,6 +1290,18 @@ SaveOneFilteredImage(g, pBitmap, path, mime) {
         return false
     dpi := GDI.GetResolution(g.pOriginal)
     GDI.SetResolution(pBitmap, dpi.x, dpi.y)
+    if mime = "image/webp" {
+        magick := FindImageMagick()
+        if magick = ""
+            return false
+        tmpPng := A_Temp "\NastarxaColorblind_Save_" A_TickCount ".png"
+        try FileDelete(tmpPng)
+        if !GDI.SaveBitmap(pBitmap, tmpPng, "image/png")
+            return false
+        RunWait('"' magick '" "' tmpPng '" -quality 95 "' path '"', , "Hide")
+        try FileDelete(tmpPng)
+        return FileExist(path)
+    }
     return GDI.SaveBitmap(pBitmap, path, mime)
 }
 
@@ -1149,7 +1367,7 @@ SaveOutput(g) {
         defaultExt := "png"
         mime := "image/png"
     }
-    filter := "Same as original (*." defaultExt ")|*." defaultExt "|PNG (*.png)|*.png|JPEG (*.jpg)|*.jpg|BMP (*.bmp)|*.bmp|TIFF (*.tif)|*.tif"
+    filter := "Same as original (*." defaultExt ")|*." defaultExt "|PNG (*.png)|*.png|JPEG (*.jpg)|*.jpg|WEBP (*.webp)|*.webp|BMP (*.bmp)|*.bmp|TIFF (*.tif)|*.tif"
     fn := FileSelect("S16", base "_" StrReplace(StrLower(g.currentType), " ", "_") "." defaultExt, "Save Filtered Image", filter)
     if fn = ""
         return
@@ -1157,7 +1375,7 @@ SaveOutput(g) {
     ext := StrLower(ext)
     mime := GetImageMimeFromExt(ext)
     if mime = "" {
-        MsgBox("This output format is not supported by GDI+ save. Use PNG, JPG, BMP, GIF, or TIFF.", "Save Error", "Iconx")
+        MsgBox("This output format is not supported. Use PNG, JPG, WEBP, BMP, GIF, or TIFF.", "Save Error", "Iconx")
         return
     }
 
@@ -1193,16 +1411,31 @@ SaveOutput(g) {
 }
 
 ToggleRegionMode(g) {
-    g._regionMode := !g._regionMode
-    if g._regionMode {
-        g._regionPt1 := 0
-        g._regionPt2 := 0
-        g.btnRegion.Text := "Cancel Region"
-        g.statText.Value := "Click top-left corner of region on Original image"
-    } else {
-        g.btnRegion.Text := "Select Region"
-        g.statText.Value := "Region selection cancelled"
+    if !g.pOriginal {
+        g.statText.Value := "Open an image before selecting a region."
+        return
     }
+    if !g._regionMode {
+        g._regionMode := true
+        dims := GDI.GetDimensions(g.pOriginal)
+        if !g._regionW || !g._regionH {
+            g._regionX := 0
+            g._regionY := 0
+            g._regionW := dims.w
+            g._regionH := dims.h
+            UpdateRegionFields(g)
+        }
+        g.btnRegion.Text := "Region On"
+        g.statText.Value := "Region enabled. Edit X/Y/W/H, then press Start."
+    } else {
+        g._regionMode := false
+        g.btnRegion.Text := "Select Region"
+        g.statText.Value := "Region disabled. Full image will be analyzed."
+    }
+    UpdateRegionInputState(g)
+    MarkAnalysisPending(g)
+    g.origPic.GetPos(, , &picW, &picH)
+    UpdateDisplayImages(g, picW, picH)
 }
 
 ClearRegion(g) {
@@ -1215,6 +1448,103 @@ ClearRegion(g) {
     g._regionH := 0
     g.btnRegion.Text := "Select Region"
     g.regionText.Value := ""
+    UpdateRegionFields(g)
+    UpdateRegionInputState(g)
+    if HasProp(g, "origPic") && g.pOriginal {
+        g.origPic.GetPos(, , &picW, &picH)
+        UpdateDisplayImages(g, picW, picH)
+    }
+}
+
+UpdateRegionFields(g) {
+    if !HasProp(g, "editRegionX")
+        return
+    g.editRegionX.Value := g._regionX
+    g.editRegionY.Value := g._regionY
+    g.editRegionW.Value := g._regionW
+    g.editRegionH.Value := g._regionH
+}
+
+UpdateRegionInputState(g) {
+    if !HasProp(g, "editRegionX")
+        return
+    enabled := g._regionMode ? true : false
+    for ctrl in [g.lblRegionX, g.editRegionX, g.lblRegionY, g.editRegionY, g.lblRegionW, g.editRegionW, g.lblRegionH, g.editRegionH]
+        ctrl.Enabled := enabled
+}
+
+PreviewRegionFromFields(g) {
+    if !g._regionMode || !g.pOriginal
+        return
+    try {
+        dims := GDI.GetDimensions(g.pOriginal)
+        x := Max(0, Min(Integer(g.editRegionX.Value), dims.w - 1))
+        y := Max(0, Min(Integer(g.editRegionY.Value), dims.h - 1))
+        w := Max(1, Min(Integer(g.editRegionW.Value), dims.w - x))
+        h := Max(1, Min(Integer(g.editRegionH.Value), dims.h - y))
+        g._regionX := x
+        g._regionY := y
+        g._regionW := w
+        g._regionH := h
+        g.regionText.Value := Format("Region: {},{} - {}x{}", x, y, w, h)
+        g.origPic.GetPos(, , &picW, &picH)
+        UpdateDisplayImages(g, picW, picH)
+    }
+}
+
+ApplyRegionFromFields(g, showError := true) {
+    if !g._regionMode
+        return true
+    if !g.pOriginal
+        return false
+    try {
+        ApplyRegion(g, g.editRegionX.Value, g.editRegionY.Value, g.editRegionW.Value, g.editRegionH.Value, true)
+        return true
+    } catch {
+        if showError
+            MsgBox("Region values must be numbers in X, Y, Width, Height.", "Invalid Region", "Iconx")
+        return false
+    }
+}
+
+ApplyRegion(g, x, y, w, h, keepActive := true) {
+    dims := GDI.GetDimensions(g.pOriginal)
+    x := Max(0, Min(Integer(x), dims.w - 1))
+    y := Max(0, Min(Integer(y), dims.h - 1))
+    w := Max(1, Min(Integer(w), dims.w - x))
+    h := Max(1, Min(Integer(h), dims.h - y))
+
+    g._regionX := x
+    g._regionY := y
+    g._regionW := w
+    g._regionH := h
+    g._regionMode := keepActive
+    g._regionPt1 := 0
+    g.btnRegion.Text := keepActive ? "Region On" : "Select Region"
+    g.regionText.Value := Format("Region: {},{} - {}x{}", x, y, w, h)
+    UpdateRegionFields(g)
+    UpdateRegionInputState(g)
+    MarkAnalysisPending(g, Format("Region set ({}x{}). Press Start to analyze it.", w, h))
+    g.origPic.GetPos(, , &picW, &picH)
+    UpdateDisplayImages(g, picW, picH)
+}
+
+ShowManualRegionDialog(g) {
+    dims := GDI.GetDimensions(g.pOriginal)
+    defaultText := g._regionW && g._regionH
+        ? Format("{},{},{},{}", g._regionX, g._regionY, g._regionW, g._regionH)
+        : Format("0,0,{},{}", dims.w, dims.h)
+    ib := InputBox("Enter region as x,y,width,height.`nImage size: " dims.w "x" dims.h, "Manual Region", "w360 h140", defaultText)
+    if ib.Result != "OK"
+        return
+    parts := StrSplit(StrReplace(ib.Value, " ", ""), ",")
+    if parts.Length != 4 {
+        MsgBox("Use this format: x,y,width,height", "Invalid Region", "Iconx")
+        return
+    }
+    try ApplyRegion(g, parts[1], parts[2], parts[3], parts[4])
+    catch
+        MsgBox("Region values must be numbers.", "Invalid Region", "Iconx")
 }
 
 ControlPointToImagePoint(ctrl, pBitmap, x, y, &px, &py) {
@@ -1260,7 +1590,10 @@ OrigContextMenu(gCtrl, x, y, *) {
         info .= t ": " HexColor(s.r, s.g, s.b) " (RGB " s.r "," s.g "," s.b ")`n"
     }
 
-    g.colorInfo.Value := info
+    if HasProp(g, "colorInfo")
+        g.colorInfo.Value := info
+    else
+        MsgBox(info, "Pixel Color")
     g.statText.Value := "Color picker at " px "," py
 }
 
@@ -1306,15 +1639,7 @@ OnOrigClick(wParam, lParam, msg, hwnd, g) {
         t := y1, y1 := y2, y2 := t
     }
 
-    g._regionX := x1
-    g._regionY := y1
-    g._regionW := x2 - x1 + 1
-    g._regionH := y2 - y1 + 1
-    g._regionMode := false
-    g._regionPt1 := 0
-    g.btnRegion.Text := "Select Region"
-    g.regionText.Value := Format("Region: {},{} - {}x{}", g._regionX, g._regionY, g._regionW, g._regionH)
-    MarkAnalysisPending(g, Format("Region set ({}x{}). Press Start to analyze it.", g._regionW, g._regionH))
+    ApplyRegion(g, x1, y1, x2 - x1 + 1, y2 - y1 + 1)
 }
 
 ; ===================================================================
@@ -1322,7 +1647,7 @@ OnOrigClick(wParam, lParam, msg, hwnd, g) {
 ; ===================================================================
 BuildGui() {
     global APP_GUI
-    g := Gui("+Resize +MinSize1050x720", "Nastarxa Image Colorbind Checker")
+    g := Gui("+MinSize1180x790 -MaximizeBox", "Nastarxa Image Colorbind Checker")
     g.BackColor := "25282E"
     g.SetFont("s10", "Segoe UI")
     g.MarginX := 14
@@ -1347,6 +1672,8 @@ BuildGui() {
     g._regionW := 0
     g._regionH := 0
     g._analysisCurrent := false
+    g.suggestionSwatches := []
+    g.suggestionSwatchCount := 0
 
     ; Top bar
     g.titleText := g.AddText("x14 y12 cFFFFFF", "Image Colorblind Checker")
@@ -1361,6 +1688,20 @@ BuildGui() {
     g.btnSave.OnEvent("Click", (*) => SaveOutput(g))
     g.btnRegion := g.AddButton("x632 y38 w80 h26", "Select Region")
     g.btnRegion.OnEvent("Click", (*) => ToggleRegionMode(g))
+    g.lblRegionX := g.AddText("x720 y78 w14 cAAAAAA", "X")
+    g.editRegionX := g.AddEdit("x736 y74 w50 h24 Number", "0")
+    g.lblRegionY := g.AddText("x792 y78 w14 cAAAAAA", "Y")
+    g.editRegionY := g.AddEdit("x808 y74 w50 h24 Number", "0")
+    g.lblRegionW := g.AddText("x864 y78 w16 cAAAAAA", "W")
+    g.editRegionW := g.AddEdit("x882 y74 w58 h24 Number", "0")
+    g.lblRegionH := g.AddText("x946 y78 w16 cAAAAAA", "H")
+    g.editRegionH := g.AddEdit("x964 y74 w58 h24 Number", "0")
+    for ctrl in [g.editRegionX, g.editRegionY, g.editRegionW, g.editRegionH] {
+        ctrl.OnEvent("Change", (*) => (
+            PreviewRegionFromFields(g),
+            MarkAnalysisPending(g, "Region values changed. Press Start to analyze.")
+        ))
+    }
 
     ; Simulation type dropdown
     g.lblMode := g.AddText("x722 y42 c909090", "Mode")
@@ -1369,6 +1710,7 @@ BuildGui() {
          , "All Three", "Grayscale", "Luminance"])
     g.cbType.OnEvent("Change", (*) => MarkAnalysisPending(g))
     g.cbType.Choose(1)
+    UpdateRegionInputState(g)
 
     ; Image display area
     g.lblOriginal := g.AddText("x14 y76 cFFFFFF", "Original")
@@ -1404,6 +1746,17 @@ BuildGui() {
 
     ; Suggestions area
     g.lblTips := g.AddText("x14 y580 cFFFFFF", "Suggestions")
+    loop 8 {
+        box := g.AddText("x14 y600 w20 h16 BackgroundFFFFFF", Chr(160))
+        arrow := g.AddText("x40 y600 w20 cFFFFFF", "->")
+        box2 := g.AddText("x62 y600 w20 h16 BackgroundFFFFFF", Chr(160))
+        label := g.AddText("x88 y600 w90 cFFFFFF", "")
+        box.Visible := false
+        arrow.Visible := false
+        box2.Visible := false
+        label.Visible := false
+        g.suggestionSwatches.Push({box: box, arrow: arrow, box2: box2, label: label})
+    }
     g.suggestions := g.AddEdit("x14 y600 w830 h100 ReadOnly BackgroundFFFFFF c000000")
 
     ; Status
@@ -1411,11 +1764,8 @@ BuildGui() {
 
     ; Events
     g.OnEvent("DropFiles", (gui, files, *) => HandleDrop(g, files))
-    g.OnEvent("Size", (gui, minMax, aW, aH) => LayoutGui(g, aW, aH))
     EnableDropFiles(g)
 
-    ; Region selection via left-click on original
-    OnMessage(0x201, (w, l, m, h) => OnOrigClick(w, l, m, h, g))
     OnMessage(0x233, (w, l, m, h) => OnDropFiles(w, l, m, h, g))
 
     g.Show("w1180 h790 Center")
@@ -1428,6 +1778,8 @@ BuildGui() {
 ; GUI Events
 ; ===================================================================
 LayoutGui(g, aW, aH) {
+    aW := 1180
+    aH := 790
     m := 14
     gap := 10
     picGap := 24
@@ -1468,6 +1820,14 @@ LayoutGui(g, aW, aH) {
     g.btnGuide.Move(guideX, actionRowY, guideW, btnH)
     g.btnSave.Move(saveX, actionRowY, saveW, btnH)
     g.btnRegion.Move(regionX, actionRowY, regionW, btnH)
+    g.lblRegionX.Move(regionX + regionW + 10, actionRowY + 5, 14, 20)
+    g.editRegionX.Move(regionX + regionW + 26, actionRowY + 2, 50, 24)
+    g.lblRegionY.Move(regionX + regionW + 84, actionRowY + 5, 14, 20)
+    g.editRegionY.Move(regionX + regionW + 100, actionRowY + 2, 50, 24)
+    g.lblRegionW.Move(regionX + regionW + 158, actionRowY + 5, 16, 20)
+    g.editRegionW.Move(regionX + regionW + 176, actionRowY + 2, 58, 24)
+    g.lblRegionH.Move(regionX + regionW + 242, actionRowY + 5, 16, 20)
+    g.editRegionH.Move(regionX + regionW + 260, actionRowY + 2, 58, 24)
 
     labelY := actionRowY + btnH + 18
     picTop := labelY + 22
@@ -1490,11 +1850,11 @@ LayoutGui(g, aW, aH) {
 
     ; Region text row
     chkY := picTop + picH + 12
-    g.regionText.Move(origX, chkY, picW, 22)
+    fullW := simX + picW - m
+    g.regionText.Move(origX, chkY, fullW, 22)
 
     ; Fixed lower sections to avoid overlap from dynamic scaling.
     ; Progress is first, then the Analysis/heatmap controls sit below it.
-    fullW := simX + picW - m
     progressY := chkY + 28
     progressTextW := 86
     g.progressText.Move(m, progressY - 4, progressTextW, 20)
@@ -1512,7 +1872,9 @@ LayoutGui(g, aW, aH) {
     maxSuggH := Max(70, aH - suggY - 44)
     suggH := Min(suggH, maxSuggH)
     g.lblTips.Move(m, suggY - 24, fullW, 20)
-    g.suggestions.Move(m, suggY, fullW, suggH)
+    swatchH := GetSuggestionSwatchHeight(g, fullW)
+    PositionSuggestionSwatches(g, m, suggY, fullW)
+    g.suggestions.Move(m, suggY + swatchH, fullW, Max(50, suggH - swatchH))
 
     ; Status
     g.statText.Move(m, suggY + suggH + 12, fullW, 20)
@@ -1542,6 +1904,17 @@ UpdateDisplayImages(g, picW, picH) {
     ; Scale original
     pScaled := GDI.ResizeBitmap(g.pOriginal, picW, picH)
     if pScaled {
+        if g._regionMode && g._regionW && g._regionH {
+            dims := GDI.GetDimensions(g.pOriginal)
+            fit := GDI.GetFitRect(dims.w, dims.h, picW, picH)
+            scaleX := fit.w / dims.w
+            scaleY := fit.h / dims.h
+            rx := fit.x + g._regionX * scaleX
+            ry := fit.y + g._regionY * scaleY
+            rw := Max(2, g._regionW * scaleX)
+            rh := Max(2, g._regionH * scaleY)
+            GDI.DrawHighlightRect(pScaled, rx, ry, rw, rh)
+        }
         g.hOrigScaled := GDI.GetHBITMAP(pScaled)
         g.origPic.Value := "HBITMAP:" g.hOrigScaled
         GDI.DisposeImage(pScaled)
@@ -1662,9 +2035,9 @@ LoadImage(g, file) {
     g.fileText.Value := name
     g.statText.Value := "Loading..."
 
-    g.pOriginal := GDI.LoadImage(file)
+    g.pOriginal := LoadBitmapWithFallback(file)
     if !g.pOriginal {
-        g.statText.Value := "Failed to load image."
+        g.statText.Value := "Failed to load image. For WebP, install ImageMagick or Windows WebP support."
         return
     }
 
@@ -1674,6 +2047,7 @@ LoadImage(g, file) {
     g._analysisCurrent := false
     g.report.Value := "Image loaded. Choose a mode, then press Start."
     g.suggestions.Value := ""
+    UpdateSuggestionSwatches(g, [], "")
     g.lblSimulated.Text := "Simulation / Heatmap"
     SetProgress(g, 0, "Ready")
     g.origPic.GetPos(&oX, &oY, &oW, &oH)
@@ -1696,11 +2070,17 @@ RefreshAnalysis(g) {
     g._analysisCurrent := false
     SetProgress(g, 2, "Preparing...")
 
+    if g._regionMode && !ApplyRegionFromFields(g) {
+        g.btnRefresh.Enabled := true
+        g._busy := false
+        return
+    }
+
     ; Clean old resources
     ClearProcessedImages(g)
 
     ; Determine working bitmap (full or region)
-    if g._regionW && g._regionH {
+    if g._regionMode && g._regionW && g._regionH {
         pWork := GDI.CloneBitmapArea(g.pOriginal, g._regionX, g._regionY, g._regionW, g._regionH)
         if !pWork
             pWork := g.pOriginal
@@ -1757,6 +2137,9 @@ RefreshAnalysis(g) {
     typeStr := IsColorblindMode(mode) ? mode : ""
     g.report.Value := GenerateReport(topColors, typeStr)
     g.suggestions.Value := GenerateSuggestions(topColors, typeStr)
+    UpdateSuggestionSwatches(g, topColors, typeStr)
+    g.GetPos(, , &guiW, &guiH)
+    LayoutGui(g, guiW, guiH)
 
     ; Clean up region clone if made
     if pWork != g.pOriginal
@@ -1824,7 +2207,7 @@ ShowGuide() {
     ; =====================================================
 
     tab := guideGui.AddTab3(
-        "xm y+10 w700 h580 BackgroundFFFFFF c202020",
+        "xm y+10 w700 h700 BackgroundFFFFFF c202020 ",
         ["2-3 Colors", "4-6 Colors", "8+ Palettes", "Tips"]
     )
 
@@ -1837,7 +2220,7 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8 ",
         "2-Color Combinations"
     )
 
@@ -1864,7 +2247,7 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8",
         "3-Color Combinations"
     )
 
@@ -1903,7 +2286,7 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8",
         "4-Color Combinations"
     )
 
@@ -1924,7 +2307,7 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8",
         "5-Color Combination"
     )
 
@@ -1939,7 +2322,7 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8",
         "6-Color Combination"
     )
 
@@ -1960,14 +2343,14 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+12 c1B6FA8",
+        "xm+6 y+12 c1B6FA8",
         "Wong 8-Color Palette"
     )
 
     guideGui.SetFont("s8", "Segoe UI")
 
     guideGui.AddText(
-        "xm y+1 c808080",
+        "xm+6 y+1 c808080",
         "Nature Methods (2011) — colorblind accessibility focused."
     )
 
@@ -1986,14 +2369,14 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+14 c1B6FA8",
+        "xm+6 y+14 c1B6FA8",
         "Okabe & Ito 8-Color Palette"
     )
 
     guideGui.SetFont("s8", "Segoe UI")
 
     guideGui.AddText(
-        "xm y+1 c808080",
+        "xm+6 y+1 c808080",
         "Designed for scientific figures and presentations."
     )
 
@@ -2006,14 +2389,14 @@ ShowGuide() {
     guideGui.SetFont("s10", "Segoe UI Semibold")
 
     guideGui.AddText(
-        "xm y+14 c1B6FA8",
+        "xm+6 y+14 c1B6FA8",
         "Tol 10-Color Palette"
     )
 
     guideGui.SetFont("s8", "Segoe UI")
 
     guideGui.AddText(
-        "xm y+1 c808080",
+        "xm+6 y+1 c808080",
         "Optimized for printability and accessibility."
     )
 
@@ -2070,9 +2453,10 @@ Recommended Pairs:
   • Purple + Yellow
   • Blue + Red
 )"
-    
-    guideGui.AddEdit(
-        "xm y+12 w660 h430 ReadOnly BackgroundFFFFFF c202020",
+    guideGui.SetFont("s9", "Segoe UI")
+
+    guideGui.AddText(
+        "xm+6 y+12 w660 h700 ReadOnly BackgroundFFFFFF c202020",
         tips
     )
 
@@ -2082,8 +2466,10 @@ Recommended Pairs:
 
     tab.UseTab()
 
+    guideGui.SetFont("s8", "Segoe UI")
+
     btnClose := guideGui.AddButton(
-        "x592 y668 w100 h28",
+        "x612 y788 w100 h28",
         "Close"
     )
 
@@ -2092,13 +2478,13 @@ Recommended Pairs:
         (*) => guideGui.Destroy()
     )
 
-    guideGui.Show("w730 h730 Center")
+    guideGui.Show("w730 h825 Center")
 }
 
 AddPaletteRow(g, label, colors) {
     g.SetFont("s9", "Segoe UI")
-    g.AddText("xm y+8 w660 c303030", label)
-    baseX := 20
+    g.AddText("xm+6 y+8 w660 c303030", label)
+    baseX := 6
     hexRow := ""
     rgbRow := ""
     for c in colors {
@@ -2109,7 +2495,7 @@ AddPaletteRow(g, label, colors) {
         if A_Index = 1
             g.AddText("xm+" baseX " y+4 w40 h18 Background" hex, Chr(160))
         else
-            g.AddText("x+48 yp w40 h18 Background" hex, Chr(160))
+            g.AddText("x+6 yp w40 h18 Background" hex, Chr(160))
         hexRow .= "  #" hex "  "
         rgbRow .= "RGB(" Format("{:03d},{:03d},{:03d}", r, g_, b) ")  "
     }
@@ -2128,7 +2514,7 @@ AddColorCodeTable(g, colors, names) {
         name := names.Length >= i ? names[i] : ""
 
         yExpr := i = 1 ? startY : "y+2"
-        g.AddText("xm " yExpr " w20 h16 Background" hex " c" hex, Chr(160))
+        g.AddText("xm+6 " yExpr " w20 h16 Background" hex " c" hex, Chr(160))
         g.AddText("x+6 yp-3 w70 c000000", name)
         g.AddText("x+4 yp w55 c555555", "#" hex)
         g.AddText("x+2 yp w90 c333333", "RGB(" rgbStr ")")
