@@ -3,6 +3,7 @@
 TraySetIcon "Colorblind.ico"
 
 APP_GUI := 0
+FULLSCREEN_VIEWERS := Map()
 
 ; ===================================================================
 ; GDI+ Wrapper
@@ -249,6 +250,41 @@ class GDI {
             , "Float", fit.x, "Float", fit.y, "Float", fit.w, "Float", fit.h
             , "Float", 0, "Float", 0, "Float", dims.w, "Float", dims.h
             , "Int", 2, "Ptr", 0, "Ptr", 0)
+        DllCall("gdiplus\GdipDeleteGraphics", "Ptr", gfx)
+        return pNew
+    }
+
+    static RenderViewport(pBitmap, viewW, viewH, drawW, drawH, offsetX, offsetY) {
+        if !pBitmap
+            return 0
+        viewW := Max(1, Round(viewW))
+        viewH := Max(1, Round(viewH))
+        drawW := Max(1, Round(drawW))
+        drawH := Max(1, Round(drawH))
+        dims := this.GetDimensions(pBitmap)
+        pNew := this.CreateBitmap(viewW, viewH)
+        if !pNew
+            return 0
+        gfx := 0
+        DllCall("gdiplus\GdipGetImageGraphicsContext", "Ptr", pNew, "Ptr*", &gfx)
+        DllCall("gdiplus\GdipGraphicsClear", "Ptr", gfx, "UInt", 0xFF1E2127)
+        DllCall("gdiplus\GdipSetInterpolationMode", "Ptr", gfx, "Int", 7)
+        dstX := Max(0, offsetX)
+        dstY := Max(0, offsetY)
+        dstR := Min(viewW, offsetX + drawW)
+        dstB := Min(viewH, offsetY + drawH)
+        dstW := dstR - dstX
+        dstH := dstB - dstY
+        if dstW > 0 && dstH > 0 {
+            srcX := (dstX - offsetX) * dims.w / drawW
+            srcY := (dstY - offsetY) * dims.h / drawH
+            srcW := dstW * dims.w / drawW
+            srcH := dstH * dims.h / drawH
+            DllCall("gdiplus\GdipDrawImageRectRect", "Ptr", gfx, "Ptr", pBitmap
+                , "Float", dstX, "Float", dstY, "Float", dstW, "Float", dstH
+                , "Float", srcX, "Float", srcY, "Float", srcW, "Float", srcH
+                , "Int", 2, "Ptr", 0, "Ptr", 0)
+        }
         DllCall("gdiplus\GdipDeleteGraphics", "Ptr", gfx)
         return pNew
     }
@@ -1194,6 +1230,8 @@ GetImageMimeFromExt(ext) {
         return "image/tiff"
     if ext = "webp"
         return "image/webp"
+    if ext = "tga"
+        return "image/tga"
     return ""
 }
 
@@ -1236,7 +1274,8 @@ LoadBitmapWithFallback(file) {
         return pBitmap
 
     SplitPath(file, , , &ext)
-    if StrLower(ext) != "webp"
+    ext := StrLower(ext)
+    if !(ext = "webp" || ext = "tga")
         return 0
 
     magick := FindImageMagick()
@@ -1290,7 +1329,7 @@ SaveOneFilteredImage(g, pBitmap, path, mime) {
         return false
     dpi := GDI.GetResolution(g.pOriginal)
     GDI.SetResolution(pBitmap, dpi.x, dpi.y)
-    if mime = "image/webp" {
+    if mime = "image/webp" || mime = "image/tga" {
         magick := FindImageMagick()
         if magick = ""
             return false
@@ -1298,7 +1337,11 @@ SaveOneFilteredImage(g, pBitmap, path, mime) {
         try FileDelete(tmpPng)
         if !GDI.SaveBitmap(pBitmap, tmpPng, "image/png")
             return false
-        RunWait('"' magick '" "' tmpPng '" -quality 95 "' path '"', , "Hide")
+        args := '"' magick '" "' tmpPng '"'
+        if mime = "image/webp"
+            args .= " -quality 95"
+        args .= ' "' path '"'
+        RunWait(args, , "Hide")
         try FileDelete(tmpPng)
         return FileExist(path)
     }
@@ -1367,7 +1410,7 @@ SaveOutput(g) {
         defaultExt := "png"
         mime := "image/png"
     }
-    filter := "Same as original (*." defaultExt ")|*." defaultExt "|PNG (*.png)|*.png|JPEG (*.jpg)|*.jpg|WEBP (*.webp)|*.webp|BMP (*.bmp)|*.bmp|TIFF (*.tif)|*.tif"
+    filter := "Same as original (*." defaultExt ")|*." defaultExt "|PNG (*.png)|*.png|JPEG (*.jpg)|*.jpg|WEBP (*.webp)|*.webp|BMP (*.bmp)|*.bmp|TGA (*.tga)|*.tga|TIFF (*.tif)|*.tif"
     fn := FileSelect("S16", base "_" StrReplace(StrLower(g.currentType), " ", "_") "." defaultExt, "Save Filtered Image", filter)
     if fn = ""
         return
@@ -1375,7 +1418,7 @@ SaveOutput(g) {
     ext := StrLower(ext)
     mime := GetImageMimeFromExt(ext)
     if mime = "" {
-        MsgBox("This output format is not supported. Use PNG, JPG, WEBP, BMP, GIF, or TIFF.", "Save Error", "Iconx")
+        MsgBox("This output format is not supported. Use PNG, JPG, WEBP, BMP, TGA, GIF, or TIFF.", "Save Error", "Iconx")
         return
     }
 
@@ -1714,11 +1757,17 @@ BuildGui() {
 
     ; Image display area
     g.lblOriginal := g.AddText("x14 y76 cFFFFFF", "Original")
+    g.btnViewOriginal := g.AddButton("x330 y74 w84 h24", "View Full")
+    g.btnViewOriginal.OnEvent("Click", (*) => ShowFullscreenPreview(g, "original"))
     g.origPic := g.AddPicture("x14 y98 w400 h300 Background1E2127")
     g.origPic.OnEvent("ContextMenu", OrigContextMenu)
+    g.origPic.OnEvent("DoubleClick", (*) => ShowFullscreenPreview(g, "original"))
 
     g.lblSimulated := g.AddText("x444 y76 cFFFFFF", "Simulation / Heatmap")
+    g.btnViewResult := g.AddButton("x760 y74 w84 h24", "View Full")
+    g.btnViewResult.OnEvent("Click", (*) => ShowFullscreenPreview(g, "result"))
     g.simPic := g.AddPicture("x444 y98 w400 h300 Background1E2127")
+    g.simPic.OnEvent("DoubleClick", (*) => ShowFullscreenPreview(g, "result"))
 
     ; 3-up simulation labels + pictures (hidden by default)
     g.sim3 := []
@@ -1728,6 +1777,7 @@ BuildGui() {
         yPos := 98 + (A_Index - 1) * 95
         g.lblSim3.Push(g.AddText("x444 y" yPos " w200 cAAAAAA", sim3Types[A_Index]))
         g.sim3.Push(g.AddPicture("x444 y" (yPos+15) " w400 h76 Background1E2127"))
+        g.sim3[A_Index].OnEvent("DoubleClick", (*) => ShowFullscreenPreview(g, "result"))
         g.lblSim3[A_Index].Visible := false
         g.sim3[A_Index].Visible := false
     }
@@ -1836,6 +1886,8 @@ LayoutGui(g, aW, aH) {
 
     g.lblOriginal.Move(origX, labelY, picW, labelH)
     g.lblSimulated.Move(simX, labelY, picW, labelH)
+    g.btnViewOriginal.Move(origX + picW - 86, labelY - 3, 86, 24)
+    g.btnViewResult.Move(simX + picW - 86, labelY - 3, 86, 24)
     g.origPic.Move(origX, picTop, picW, picH)
     g.simPic.Move(simX, picTop, picW, picH)
 
@@ -1966,8 +2018,476 @@ UpdateDisplayImages(g, picW, picH) {
     }
 }
 
+ShowFullscreenPreview(g, which) {
+    if which = "original" {
+        if !g.pOriginal {
+            g.statText.Value := "Open an image before viewing it full screen."
+            return
+        }
+        ShowFullscreenViewer("Original Image", [g.pOriginal], ["Original"])
+        return
+    }
+
+    if !g.pOriginal {
+        g.statText.Value := "Open an image before viewing the result."
+        return
+    }
+    if g.currentType = "All Three" && !g.chkHeat.Value && g._sim3Bitmaps && g._sim3Bitmaps.Length {
+        ShowFullscreenThree(g)
+        return
+    }
+
+    pBitmap := g.pHeat ? g.pHeat : (g.pSimulated ? g.pSimulated : g.pOriginal)
+    if !pBitmap {
+        g.statText.Value := "Press Start before viewing the filtered result."
+        return
+    }
+    title := g.pHeat ? "Confusion Heatmap - " g.currentType
+        : (g.pSimulated ? g.currentType : "Simulation / Heatmap")
+    ShowFullscreenViewer(title, [pBitmap], [title])
+}
+
+ShowFullscreenThree(g) {
+    if !g._sim3Bitmaps || g._sim3Bitmaps.Length = 0 {
+        g.statText.Value := "No All Three result is ready yet."
+        return
+    }
+    modes := ["Deuteranopia", "Protanopia", "Tritanopia"]
+    ShowFullscreenViewer("All Three Simulations", g._sim3Bitmaps, modes)
+}
+
+ShowFullscreenViewer(title, bitmaps, labels) {
+    if !bitmaps || bitmaps.Length = 0
+        return
+
+    MonitorGetWorkArea(, &left, &top, &right, &bottom)
+    monW := right - left
+    monH := bottom - top
+    margin := 16
+    toolbarH := 46
+    minW := 520
+    minH := 360
+    ideal := GetFullscreenInitialSize(bitmaps, monW, monH, margin, toolbarH)
+    winW := Max(minW, Min(monW, ideal.w))
+    winH := Max(minH, Min(monH, ideal.h))
+    winX := left + Floor((monW - winW) / 2)
+    winY := top + Floor((monH - winH) / 2)
+
+    fg := Gui("+AlwaysOnTop +Resize +MinSize520x360 +MaxSize" monW "x" monH, title)
+    fg.BackColor := "20242A"
+    fg.SetFont("s10", "Segoe UI")
+
+    state := {
+        gui: fg,
+        title: title,
+        bitmaps: bitmaps,
+        labels: labels,
+        handles: [],
+        pics: [],
+        labelCtrls: [],
+        pans: [],
+        viewRects: [],
+        hwnd: fg.Hwnd,
+        closed: false,
+        zoom: 1.0,
+        fitMode: true,
+        margin: margin,
+        toolbarH: toolbarH,
+        monLeft: left,
+        monTop: top,
+        monW: monW,
+        monH: monH,
+        panning: false,
+        panIndex: 0,
+        dragStartX: 0,
+        dragStartY: 0,
+        dragPanX: 0,
+        dragPanY: 0,
+        lastPanRender: 0,
+        activeIndex: 1,
+        resizing: false
+    }
+
+    state.titleText := fg.AddText("x16 y14 w220 h22 cFFFFFF", title)
+    state.btnZoomOut := fg.AddButton("x250 y10 w52 h28", "-")
+    state.btnActual := fg.AddButton("x308 y10 w58 h28", "100%")
+    state.btnFit := fg.AddButton("x372 y10 w52 h28", "Fit")
+    state.btnZoomIn := fg.AddButton("x430 y10 w52 h28", "+")
+    state.zoomText := fg.AddText("x490 y14 w70 h22 cB8B8B8", "Fit")
+    state.btnClose := fg.AddButton("x568 y10 w70 h28", "Close")
+
+    loop bitmaps.Length {
+        labelText := (A_Index <= labels.Length) ? labels[A_Index] : ""
+        state.labelCtrls.Push(fg.AddText("x16 y50 w200 h20 cFFFFFF", labelText))
+        state.pics.Push(fg.AddPicture("x16 y72 w200 h120 +0x100 Background1E2127"))
+        state.pans.Push({x: 0, y: 0})
+        state.viewRects.Push({w: 1, h: 1, drawW: 1, drawH: 1})
+    }
+
+    state.btnZoomOut.OnEvent("Click", (*) => FullscreenChangeZoom(state, 1 / 1.25))
+    state.btnZoomIn.OnEvent("Click", (*) => FullscreenChangeZoom(state, 1.25))
+    state.btnActual.OnEvent("Click", (*) => FullscreenSetActualSize(state))
+    state.btnFit.OnEvent("Click", (*) => FullscreenSetFit(state))
+    state.btnClose.OnEvent("Click", (*) => CloseFullscreenViewer(state))
+    fg.OnEvent("Close", (*) => CloseFullscreenViewer(state))
+    fg.OnEvent("Escape", (*) => CloseFullscreenViewer(state))
+    fg.OnEvent("Size", (guiObj, minMax, width, height) => FullscreenOnSize(state, minMax, width, height))
+
+    fg.Show("x" winX " y" winY " w" winW " h" winH)
+    RegisterFullscreenViewer(state)
+    FullscreenRender(state, winW, winH)
+}
+
+GetFullscreenInitialSize(bitmaps, monW, monH, margin, toolbarH) {
+    count := bitmaps.Length
+    maxW := 0
+    totalH := toolbarH + margin
+    for pBitmap in bitmaps {
+        dims := GDI.GetDimensions(pBitmap)
+        maxW := Max(maxW, dims.w)
+        totalH += dims.h + 24
+    }
+    totalH += margin + Max(0, count - 1) * 10
+    return {
+        w: Min(monW, maxW + margin * 2),
+        h: Min(monH, totalH)
+    }
+}
+
+FullscreenOnSize(state, minMax, width, height) {
+    if state.closed || minMax = -1
+        return
+    FullscreenRender(state, width, height)
+}
+
+FullscreenChangeZoom(state, factor) {
+    state.fitMode := false
+    state.zoom := Max(0.1, Min(8.0, state.zoom * factor))
+    FullscreenRenderFromGui(state)
+}
+
+FullscreenSetActualSize(state) {
+    state.fitMode := false
+    state.zoom := 1.0
+    FullscreenRenderFromGui(state)
+}
+
+FullscreenSetFit(state) {
+    state.fitMode := true
+    ResetFullscreenPans(state)
+    FullscreenRenderFromGui(state)
+}
+
+ResetFullscreenPans(state) {
+    loop state.pans.Length
+        state.pans[A_Index] := {x: 0, y: 0}
+}
+
+FullscreenRenderFromGui(state) {
+    if state.closed
+        return
+    state.gui.GetPos(, , &w, &h)
+    FullscreenRender(state, w, h)
+}
+
+FullscreenRender(state, winW, winH) {
+    if state.closed || state.resizing || winW < 120 || winH < 120
+        return
+    state.resizing := true
+    oldHandles := state.handles
+    state.handles := []
+
+    margin := state.margin
+    toolbarH := state.toolbarH
+    contentW := Max(120, winW - margin * 2)
+    contentH := Max(90, winH - toolbarH - margin)
+    count := state.bitmaps.Length
+    rowGap := count > 1 ? 10 : 0
+    rowH := count > 1 ? Floor((contentH - rowGap * (count - 1)) / count) : contentH
+    rowH := Max(80, rowH)
+
+    closeW := 70
+    zoomTextW := 70
+    zoomGroupW := 52 + 6 + 58 + 6 + 52 + 6 + 52
+    rightX := Max(margin + zoomGroupW + zoomTextW + 18, winW - margin - closeW)
+    zoomTextX := rightX - 8 - zoomTextW
+    zoomX := Max(margin + 120, zoomTextX - 8 - zoomGroupW)
+    titleW := Max(100, zoomX - margin - 10)
+    state.titleText.Move(margin, 14, titleW, 22)
+    state.btnClose.Move(rightX, 10, closeW, 28)
+    state.btnZoomOut.Move(zoomX, 10, 52, 28)
+    state.btnActual.Move(zoomX + 58, 10, 58, 28)
+    state.btnFit.Move(zoomX + 122, 10, 52, 28)
+    state.btnZoomIn.Move(zoomX + 180, 10, 52, 28)
+    state.zoomText.Move(zoomTextX, 14, zoomTextW, 22)
+    state.zoomText.Value := state.fitMode ? "Fit" : Round(state.zoom * 100) "%"
+
+    y := toolbarH
+    loop count {
+        pBitmap := state.bitmaps[A_Index]
+        labelCtrl := state.labelCtrls[A_Index]
+        picCtrl := state.pics[A_Index]
+        labelCtrl.Move(margin, y, contentW, 20)
+        y += 22
+
+        dims := GDI.GetDimensions(pBitmap)
+        picH := Max(50, rowH - 22)
+        if state.fitMode {
+            fit := GDI.GetFitRect(dims.w, dims.h, contentW, picH)
+            drawW := fit.w
+            drawH := fit.h
+            pan := {x: 0, y: 0}
+            state.pans[A_Index] := pan
+        } else {
+            drawW := Max(1, Round(dims.w * state.zoom))
+            drawH := Max(1, Round(dims.h * state.zoom))
+            pan := ClampFullscreenPan(state.pans[A_Index], contentW, picH, drawW, drawH)
+            state.pans[A_Index] := pan
+        }
+        x := margin
+        picCtrl.Move(x, y, contentW, picH)
+        state.viewRects[A_Index] := {x: x, y: y, w: contentW, h: picH, drawW: drawW, drawH: drawH}
+
+        drawX := Floor((contentW - drawW) / 2) + pan.x
+        drawY := Floor((picH - drawH) / 2) + pan.y
+        pView := GDI.RenderViewport(pBitmap, contentW, picH, drawW, drawH, drawX, drawY)
+        if pView {
+            hb := GDI.GetHBITMAP(pView)
+            state.handles.Push(hb)
+            picCtrl.Value := "HBITMAP:" hb
+            GDI.DisposeImage(pView)
+        }
+        y += picH + rowGap
+    }
+    DeleteBitmapHandles(oldHandles)
+    state.resizing := false
+}
+
+DeleteBitmapHandles(handles) {
+    for hb in handles {
+        if hb
+            DllCall("DeleteObject", "Ptr", hb)
+    }
+}
+
+ClampFullscreenPan(pan, viewW, viewH, drawW, drawH) {
+    if drawW <= viewW
+        pan.x := 0
+    else {
+        limitX := Ceil((drawW - viewW) / 2)
+        pan.x := Max(-limitX, Min(limitX, pan.x))
+    }
+    if drawH <= viewH
+        pan.y := 0
+    else {
+        limitY := Ceil((drawH - viewH) / 2)
+        pan.y := Max(-limitY, Min(limitY, pan.y))
+    }
+    return pan
+}
+
+RegisterFullscreenViewer(state) {
+    global FULLSCREEN_VIEWERS
+    if FULLSCREEN_VIEWERS.Count = 0 {
+        OnMessage(0x201, FullscreenMouseDown)
+        OnMessage(0x200, FullscreenMouseMove)
+        OnMessage(0x202, FullscreenMouseUp)
+        OnMessage(0x100, FullscreenKeyDown)
+        OnMessage(0x020A, FullscreenMouseWheel)
+    }
+    FULLSCREEN_VIEWERS[state.hwnd] := {state: state, index: 0}
+    for idx, pic in state.pics
+        FULLSCREEN_VIEWERS[pic.Hwnd] := {state: state, index: idx}
+}
+
+UnregisterFullscreenViewer(state) {
+    global FULLSCREEN_VIEWERS
+    if FULLSCREEN_VIEWERS.Has(state.hwnd)
+        FULLSCREEN_VIEWERS.Delete(state.hwnd)
+    for pic in state.pics {
+        if FULLSCREEN_VIEWERS.Has(pic.Hwnd)
+            FULLSCREEN_VIEWERS.Delete(pic.Hwnd)
+    }
+}
+
+FullscreenMouseDown(wParam, lParam, msg, hwnd) {
+    global FULLSCREEN_VIEWERS
+    entry := GetFullscreenViewerEntry(hwnd)
+    if !entry
+        return
+    state := entry.state
+    if state.closed || state.fitMode
+        return
+    idx := entry.index
+    if idx = 0
+        idx := FullscreenHitTestRow(state, hwnd, lParam)
+    if idx = 0
+        return
+    rect := state.viewRects[idx]
+    if rect.drawW <= rect.w && rect.drawH <= rect.h
+        return
+    state.panning := true
+    state.panIndex := idx
+    state.activeIndex := idx
+    pt := GetFullscreenClientPoint(state, hwnd, lParam)
+    state.dragStartX := pt.x
+    state.dragStartY := pt.y
+    state.dragPanX := state.pans[idx].x
+    state.dragPanY := state.pans[idx].y
+    DllCall("user32\SetCapture", "Ptr", state.hwnd)
+    return 0
+}
+
+FullscreenMouseMove(wParam, lParam, msg, hwnd) {
+    global FULLSCREEN_VIEWERS
+    entry := GetFullscreenViewerEntry(hwnd)
+    if !entry
+        return
+    state := entry.state
+    if state.closed || !state.panning
+        return
+    pt := GetFullscreenClientPoint(state, hwnd, lParam)
+    x := pt.x
+    y := pt.y
+    idx := state.panIndex
+    rect := state.viewRects[idx]
+    pan := {
+        x: state.dragPanX + x - state.dragStartX,
+        y: state.dragPanY + y - state.dragStartY
+    }
+    state.pans[idx] := ClampFullscreenPan(pan, rect.w, rect.h, rect.drawW, rect.drawH)
+    if A_TickCount - state.lastPanRender > 2 {
+        state.lastPanRender := A_TickCount
+        FullscreenRenderFromGui(state)
+    }
+    return 0
+}
+
+FullscreenMouseUp(wParam, lParam, msg, hwnd) {
+    global FULLSCREEN_VIEWERS
+    handled := false
+    for entryHwnd, entry in FULLSCREEN_VIEWERS {
+        state := entry.state
+        if state.panning {
+            state.panning := false
+            FullscreenRenderFromGui(state)
+            handled := true
+        }
+    }
+    if handled {
+        DllCall("user32\ReleaseCapture")
+        return 0
+    }
+}
+
+FullscreenKeyDown(wParam, lParam, msg, hwnd) {
+    entry := GetFullscreenViewerEntry(hwnd)
+    if !entry
+        return
+    state := entry.state
+    if state.closed
+        return
+
+    key := Integer(wParam)
+    step := GetKeyState("Shift", "P") ? 80 : 30
+    if key = 0x25 || key = 0x41 { ; Left / A
+        FullscreenPanBy(state, -step, 0)
+        return 0
+    }
+    if key = 0x27 || key = 0x44 { ; Right / D
+        FullscreenPanBy(state, step, 0)
+        return 0
+    }
+    if key = 0x26 || key = 0x57 { ; Up / W
+        FullscreenPanBy(state, 0, -step)
+        return 0
+    }
+    if key = 0x28 || key = 0x53 { ; Down / S
+        FullscreenPanBy(state, 0, step)
+        return 0
+    }
+}
+
+FullscreenMouseWheel(wParam, lParam, msg, hwnd) {
+    entry := GetFullscreenViewerEntry(hwnd)
+    if !entry
+        return
+    state := entry.state
+    if state.closed
+        return
+    delta := (wParam >> 16) & 0xFFFF
+    if delta & 0x8000
+        delta -= 0x10000
+    if delta > 0
+        FullscreenChangeZoom(state, 1.12)
+    else if delta < 0
+        FullscreenChangeZoom(state, 1 / 1.12)
+    return 0
+}
+
+FullscreenPanBy(state, dx, dy) {
+    if state.fitMode
+        return
+    idx := state.activeIndex
+    if idx < 1 || idx > state.viewRects.Length
+        idx := 1
+    rect := state.viewRects[idx]
+    if rect.drawW <= rect.w && rect.drawH <= rect.h
+        return
+    pan := {x: state.pans[idx].x + dx, y: state.pans[idx].y + dy}
+    state.pans[idx] := ClampFullscreenPan(pan, rect.w, rect.h, rect.drawW, rect.drawH)
+    FullscreenRenderFromGui(state)
+}
+
+GetFullscreenViewerEntry(hwnd) {
+    global FULLSCREEN_VIEWERS
+    if FULLSCREEN_VIEWERS.Has(hwnd)
+        return FULLSCREEN_VIEWERS[hwnd]
+    parent := DllCall("user32\GetAncestor", "Ptr", hwnd, "UInt", 2, "Ptr")
+    if parent && FULLSCREEN_VIEWERS.Has(parent)
+        return FULLSCREEN_VIEWERS[parent]
+    return 0
+}
+
+FullscreenHitTestRow(state, hwnd, lParam) {
+    pt := GetFullscreenClientPoint(state, hwnd, lParam)
+    for idx, rect in state.viewRects {
+        if pt.x >= rect.x && pt.x <= rect.x + rect.w && pt.y >= rect.y && pt.y <= rect.y + rect.h
+            return idx
+    }
+    return 0
+}
+
+GetFullscreenClientPoint(state, hwnd, lParam) {
+    x := lParam & 0xFFFF
+    y := (lParam >> 16) & 0xFFFF
+    if x & 0x8000
+        x -= 0x10000
+    if y & 0x8000
+        y -= 0x10000
+    if hwnd != state.hwnd {
+        pt := Buffer(8, 0)
+        NumPut("Int", x, pt, 0)
+        NumPut("Int", y, pt, 4)
+        DllCall("user32\ClientToScreen", "Ptr", hwnd, "Ptr", pt)
+        DllCall("user32\ScreenToClient", "Ptr", state.hwnd, "Ptr", pt)
+        x := NumGet(pt, 0, "Int")
+        y := NumGet(pt, 4, "Int")
+    }
+    return {x: x, y: y}
+}
+
+CloseFullscreenViewer(state) {
+    if state.closed
+        return
+    state.closed := true
+    UnregisterFullscreenViewer(state)
+    DeleteBitmapHandles(state.handles)
+    state.gui.Destroy()
+}
+
 BrowseFile(g) {
-    file := FileSelect(1, , "Select Image", "Images (*.png; *.jpg; *.jpeg; *.bmp; *.tif; *.tiff; *.webp; *.gif)")
+    file := FileSelect(1, , "Select Image", "Images (*.png; *.jpg; *.jpeg; *.bmp; *.tga; *.tif; *.tiff; *.webp; *.gif)")
     if file = ""
         return
     LoadImage(g, file)
@@ -2014,7 +2534,7 @@ OnDropFiles(wParam, lParam, msg, hwnd, g) {
 
 LoadImage(g, file) {
     ext := "." StrLower(SubStr(file, InStr(file, ".", 0, -1) + 1))
-    static valid := ["png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "gif"]
+    static valid := ["png", "jpg", "jpeg", "bmp", "tga", "tif", "tiff", "webp", "gif"]
     ok := false
     for v in valid {
         if ext = "." v {
@@ -2037,7 +2557,7 @@ LoadImage(g, file) {
 
     g.pOriginal := LoadBitmapWithFallback(file)
     if !g.pOriginal {
-        g.statText.Value := "Failed to load image. For WebP, install ImageMagick or Windows WebP support."
+        g.statText.Value := "Failed to load image. For WebP/TGA, install ImageMagick or Windows codec support."
         return
     }
 
@@ -2208,7 +2728,7 @@ ShowGuide() {
 
     tab := guideGui.AddTab3(
         "xm y+10 w700 h700 BackgroundFFFFFF c202020 ",
-        ["2-3 Colors", "4-6 Colors", "8+ Palettes", "Tips"]
+        ["2-3 Colors", "4-6 Colors", "8+ Palettes", "Confusion Maps", "Tips"]
     )
 
     ; =====================================================
@@ -2407,7 +2927,84 @@ ShowGuide() {
     )
 
     ; =====================================================
-    ; TAB 4
+    ; TAB 4 — Confusion Maps
+    ; =====================================================
+
+    tab.UseTab("Confusion Maps")
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+12 c1B6FA8", "What is a Confusion Map?")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "A confusion map highlights regions of an image where colors become indistinguishable"
+        " for a specific type of color vision deficiency. Similar-looking colors are grouped"
+        " together, revealing where important details, text, or data may be lost.")
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+16 c1B6FA8", "Grayscale")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "The image converted to perceived brightness only, discarding all hue information."
+        " Two colors with similar luminance but different hues will appear identical."
+        " Essential for checking whether your palette relies solely on color differences."
+    )
+    guideGui.AddText("xm+6 y+2 w660 c606060",
+        "Use: Verify that key elements remain distinguishable when printed in black-and-white"
+        " or viewed on a monochrome display."
+    )
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+16 c1B6FA8", "Luminance")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "A pure luminance channel showing the computed brightness of each pixel independent"
+        " of hue and saturation. Unlike grayscale (which uses standard luminance weights),"
+        " this map uses the exact luminance formula applied during color-blind simulation."
+    )
+    guideGui.AddText("xm+6 y+2 w660 c606060",
+        "Use: Identify contrast problems — elements with nearly identical luminance"
+        " values may be invisible to users with low vision or on low-contrast displays."
+    )
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+16 c1B6FA8", "Protanopia  (red-blind)")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "Reduced sensitivity to long wavelengths (reds). Reds, oranges, and yellows"
+        " appear darker and are easily confused with greens, browns, and even blacks."
+        " The confusion map shows which red/green/brown pairs collapse into the same"
+        " perceived color."
+    )
+    guideGui.AddText("xm+6 y+2 w660 c606060",
+        "~1-2% of males. Avoid: red/green, red/brown, red/black distinctions."
+    )
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+16 c1B6FA8", "Deuteranopia  (green-blind)")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "Reduced sensitivity to medium wavelengths (greens). The most common form of"
+        " color blindness. Greens, reds, yellows, and oranges become nearly indistinguishable."
+        " The confusion map reveals broad merged regions where hue information is lost."
+    )
+    guideGui.AddText("xm+6 y+2 w660 c606060",
+        "~5-8% of males. Avoid: green/red, green/brown, green/blue distinctions."
+    )
+
+    guideGui.SetFont("s10", "Segoe UI Semibold")
+    guideGui.AddText("xm+6 y+16 c1B6FA8", "Tritanopia  (blue-blind)")
+    guideGui.SetFont("s9", "Segoe UI")
+    guideGui.AddText("xm+6 y+4 w660 c404040",
+        "Reduced sensitivity to short wavelengths (blues). Blues and greens become confused,"
+        " as do yellows and pinks. Unlike protanopia/deuteranopia, tritanopia affects"
+        " blue-yellow discrimination and is equally rare in males and females."
+    )
+    guideGui.AddText("xm+6 y+2 w660 c606060",
+        "~0.01% of population. Avoid: blue/green, yellow/pink, blue/purple distinctions."
+    )
+
+    ; =====================================================
+    ; TAB 5
     ; =====================================================
 
     tab.UseTab("Tips")
