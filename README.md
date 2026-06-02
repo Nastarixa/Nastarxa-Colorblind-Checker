@@ -12,6 +12,7 @@ Designed for artists, UI designers, game developers, and accessibility-focused w
 ## 🖼 Image Preview
 
 ![1](docs/images/1.png)
+![2](docs/images/2.png)
 
 ---
 
