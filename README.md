@@ -1,6 +1,8 @@
 # 🎨 Nastarxa Image Colorblind Checker
 
-A Windows desktop accessibility tool built with AutoHotkey v2 for previewing artwork, illustrations, UI mockups, and graphics through common colorblind simulation modes.
+> 👁️ Accessibility preview tool for artists and designers.
+
+Preview artwork and UI through common colorblind simulation modes to improve accessibility and readability.
 
 Designed for artists, UI designers, game developers, and accessibility-focused workflows.
 
